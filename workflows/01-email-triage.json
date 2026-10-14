@@ -1,0 +1,268 @@
+{
+  "id": "ai-email-triage-001",
+  "name": "AI - Email triage and routing",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "email-triage",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "webhook-in",
+      "name": "Inbound email (webhook)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "webhookId": "email-triage-001"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalise the inbound payload into a strict shape.\n// A malformed payload is rejected here, before any LLM call.\nconst body = $json.body ?? $json;\nconst subject = (body.subject || '').toString().trim();\nconst text = (body.text || body.body || '').toString().trim();\nif (!subject && !text) {\n  throw new Error('email has no subject or body');\n}\nreturn [{ json: { subject, text, from: (body.from || '').toString() } }];"
+      },
+      "id": "normalise",
+      "name": "Validate + normalise",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        460,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$env.GROQ_API_KEY}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"llama-3.1-8b-instant\",\n  \"temperature\": 0,\n  \"response_format\": {\"type\": \"json_object\"},\n  \"messages\": [\n    {\"role\": \"system\", \"content\": \"Classify the email and reply with ONLY JSON: {\\\"category\\\": one of [sales, support, billing, spam], \\\"urgent\\\": true|false, \\\"summary\\\": <=15 words}\"},\n    {\"role\": \"user\", \"content\": \"Subject: {{$json.subject}}\\n\\n{{$json.text}}\"}\n  ]\n}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "classify",
+      "name": "LLM classify (Groq)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        680,
+        300
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse the model output safely. If the LLM failed or returned junk,\n// fall back to a human queue - never route on garbage.\nconst raw = $json.choices?.[0]?.message?.content;\nlet parsed = null;\ntry { parsed = JSON.parse(raw); } catch (e) { parsed = null; }\nconst ok = parsed && ['sales','support','billing','spam'].includes(parsed.category);\nreturn [{ json: {\n  category: ok ? parsed.category : 'unclassified',\n  urgent: ok ? !!parsed.urgent : true,\n  summary: ok ? parsed.summary : 'LLM unavailable - needs human',\n  needs_human: !ok\n} }];"
+      },
+      "id": "parse",
+      "name": "Parse + guard",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        900,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{$json.category}}",
+                    "rightValue": "sales",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "sales"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "leftValue": "={{$json.category}}",
+                    "rightValue": "support",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "support"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "route",
+      "name": "Route by category",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1120,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.SLACK_WEBHOOK_SALES}}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"text\": \"🟢 SALES · {{$json.summary}}\"}"
+      },
+      "id": "to-sales",
+      "name": "Slack #sales",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1360,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$json.needs_human ? $env.SLACK_WEBHOOK_TRIAGE : $env.SLACK_WEBHOOK_SUPPORT}}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"text\": \"{{$json.needs_human ? '🟠 NEEDS HUMAN' : '🔵 SUPPORT'}} · {{$json.summary}}\"}"
+      },
+      "id": "to-support",
+      "name": "Slack #support / #triage",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1360,
+        420
+      ]
+    }
+  ],
+  "connections": {
+    "Inbound email (webhook)": {
+      "main": [
+        [
+          {
+            "node": "Validate + normalise",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate + normalise": {
+      "main": [
+        [
+          {
+            "node": "LLM classify (Groq)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM classify (Groq)": {
+      "main": [
+        [
+          {
+            "node": "Parse + guard",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse + guard": {
+      "main": [
+        [
+          {
+            "node": "Route by category",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by category": {
+      "main": [
+        [
+          {
+            "node": "Slack #sales",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Slack #support / #triage",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Slack #support / #triage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "description": "Classify inbound email with an LLM, route to the right channel, and send anything the model could not classify to a human queue. Safe by construction: malformed payloads are rejected before the LLM call, and an LLM failure falls back to human triage, never to a wrong route.",
+    "requires": [
+      "GROQ_API_KEY",
+      "SLACK_WEBHOOK_SALES",
+      "SLACK_WEBHOOK_SUPPORT",
+      "SLACK_WEBHOOK_TRIAGE"
+    ]
+  },
+  "tags": []
+}

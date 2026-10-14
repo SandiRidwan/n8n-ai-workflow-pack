@@ -1,0 +1,298 @@
+{
+  "id": "ai-lead-enrich-002",
+  "name": "AI - Lead enrichment with duplicate guard",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "lead-enrich",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "webhook",
+      "name": "Lead form submit",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "webhookId": "lead-enrich-001"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Required fields only. Reject early rather than send junk to the LLM.\nconst b = $json.body ?? $json;\nconst email = (b.email || '').trim().toLowerCase();\nif (!/^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$/.test(email)) {\n  throw new Error('invalid or missing email');\n}\nreturn [{ json: {\n  email,\n  company: (b.company || '').trim(),\n  website: (b.website || '').trim(),\n  notes: (b.notes || '').trim()\n} }];"
+      },
+      "id": "validate",
+      "name": "Validate lead",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        460,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "documentId": {
+          "__rl": true,
+          "value": "={{$env.SHEET_ID}}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Leads",
+          "mode": "name"
+        },
+        "returnAll": true,
+        "options": {}
+      },
+      "id": "read-sheet",
+      "name": "Read existing leads",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        680,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// DUPLICATE GUARD: compare the new email against everything already stored,\n// keyed on email. A duplicate stops here (no enrich, no second CRM record).\nconst seen = new Set(\n  $('Read existing leads').all().map(i => (i.json.email || '').toString().trim().toLowerCase())\n);\nconst lead = $json;\nif (seen.has(lead.email)) {\n  return [{ json: { ...lead, duplicate: true, stop: true } }];\n}\nreturn [{ json: { ...lead, duplicate: false, stop: false } }];"
+      },
+      "id": "dedupe",
+      "name": "Duplicate guard",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        900,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{$json.duplicate}}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "if-dup",
+      "name": "Is duplicate?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1120,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$env.GROQ_API_KEY}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"llama-3.1-8b-instant\",\n  \"temperature\": 0,\n  \"response_format\": {\"type\": \"json_object\"},\n  \"messages\": [\n    {\"role\": \"system\", \"content\": \"Enrich a B2B lead. Reply ONLY JSON: {\\\"industry\\\": str, \\\"icp_score\\\": 0-100 int, \\\"reason\\\": <=12 words}. Score ICP fit for a data/automation buyer.\"},\n    {\"role\": \"user\", \"content\": \"company={{$json.company}} website={{$json.website}} notes={{$json.notes}}\"}\n  ]\n}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "enrich",
+      "name": "LLM enrich (Groq)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1360,
+        200
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse enrich output; a failure yields a neutral score, never a fake one.\nconst raw = $json.choices?.[0]?.message?.content;\nlet p = null;\ntry { p = JSON.parse(raw); } catch (e) { p = null; }\nconst lead = $('Duplicate guard').item.json;\nconst score = (p && Number.isFinite(p.icp_score)) ? Math.max(0, Math.min(100, p.icp_score)) : null;\nreturn [{ json: {\n  email: lead.email, company: lead.company, website: lead.website,\n  industry: p?.industry ?? 'unknown',\n  icp_score: score,\n  icp_reason: p?.reason ?? 'enrichment failed',\n  status: score === null ? 'needs_review' : (score >= 70 ? 'hot' : score >= 40 ? 'warm' : 'cold')\n} }];"
+      },
+      "id": "parse-enrich",
+      "name": "Parse enrich",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1580,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "={{$env.SHEET_ID}}",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Leads",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "append",
+      "name": "Append to sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1800,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Duplicate path: respond clearly, do not write a second row.\nconst lead = $json;\nreturn [{ json: { status: 'duplicate_skipped', email: lead.email } }];"
+      },
+      "id": "dup-response",
+      "name": "Skip duplicate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1360,
+        460
+      ]
+    }
+  ],
+  "connections": {
+    "Lead form submit": {
+      "main": [
+        [
+          {
+            "node": "Validate lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate lead": {
+      "main": [
+        [
+          {
+            "node": "Read existing leads",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Read existing leads": {
+      "main": [
+        [
+          {
+            "node": "Duplicate guard",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Duplicate guard": {
+      "main": [
+        [
+          {
+            "node": "Is duplicate?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is duplicate?": {
+      "main": [
+        [
+          {
+            "node": "Skip duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "LLM enrich (Groq)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM enrich (Groq)": {
+      "main": [
+        [
+          {
+            "node": "Parse enrich",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse enrich": {
+      "main": [
+        [
+          {
+            "node": "Append to sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "description": "Validate a lead, check for duplicates against the existing sheet BEFORE spending an LLM call or writing a row, enrich with an ICP score, and tag hot/warm/cold. A failed enrichment yields needs_review, not a fabricated score.",
+    "requires": [
+      "GROQ_API_KEY",
+      "SHEET_ID",
+      "Google Sheets credential"
+    ]
+  },
+  "tags": []
+}

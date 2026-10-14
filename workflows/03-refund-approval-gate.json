@@ -1,0 +1,252 @@
+{
+  "id": "ai-refund-approval-003",
+  "name": "AI - Human-in-the-loop refund approval",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "refund-request",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "webhook",
+      "name": "Refund request",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        240,
+        320
+      ],
+      "webhookId": "refund-approval-001"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate the request shape; refunds are sensitive, so reject anything odd.\nconst b = $json.body ?? $json;\nconst amount = Number(b.amount);\nconst orderId = (b.order_id || '').toString().trim();\nconst reason = (b.reason || '').toString().trim();\nif (!orderId) throw new Error('order_id required');\nif (!Number.isFinite(amount) || amount <= 0) throw new Error('amount must be > 0');\nreturn [{ json: { orderId, amount, reason } }];"
+      },
+      "id": "validate",
+      "name": "Validate request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        460,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// POLICY: this decides whether a human must approve.\n// The rule is explicit and auditable, not buried in a prompt.\nconst { amount } = $json;\nconst AUTO_APPROVE_MAX = Number($env.AUTO_APPROVE_MAX || 0);\nconst needsApproval = amount > AUTO_APPROVE_MAX;\nreturn [{ json: {\n  ...$json,\n  needsApproval,\n  policy: `auto-approve up to ${AUTO_APPROVE_MAX}; above that a human must approve`\n} }];"
+      },
+      "id": "policy",
+      "name": "Approval policy",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        680,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{$json.needsApproval}}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "if-approval",
+      "name": "Needs human approval?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        900,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.SLACK_WEBHOOK_APPROVALS}}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"text\": \"⚠️ Refund approval needed\",\n  \"blocks\": [\n    {\"type\":\"section\",\"text\":{\"type\":\"mrkdwn\",\"text\":\"*Refund request* — ${{$json.amount}} on order {{$json.orderId}}\\nReason: {{$json.reason}}\\nPolicy: {{$json.policy}}\"}},\n    {\"type\":\"actions\",\"elements\":[\n      {\"type\":\"button\",\"text\":{\"type\":\"plain_text\",\"text\":\"Approve\"},\"style\":\"primary\",\"value\":\"approve:{{$json.orderId}}\"},\n      {\"type\":\"button\",\"text\":{\"type\":\"plain_text\",\"text\":\"Reject\"},\"style\":\"danger\",\"value\":\"reject:{{$json.orderId}}\"}\n    ]}\n  ]\n}"
+      },
+      "id": "ask-approval",
+      "name": "Ask for approval (Slack)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1140,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Sensitive path WITHOUT approval: do NOT refund. Park it until a human acts.\n// Failing closed is the whole point of a human-in-the-loop gate.\nreturn [{ json: {\n  ...$json,\n  action: 'pending_human_approval',\n  refunded: false\n} }];"
+      },
+      "id": "hold",
+      "name": "Hold for approval",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1380,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.STRIPE_API_URL}}/v1/refunds",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$env.STRIPE_API_KEY}}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"payment_intent\": \"{{$json.orderId}}\", \"amount\": {{Math.round($json.amount * 100)}} }",
+        "options": {}
+      },
+      "id": "refund",
+      "name": "Issue refund (auto-approved)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1140,
+        460
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Audit record for every request, refunded or held.\nreturn [{ json: {\n  orderId: $json.orderId,\n  amount: $json.amount,\n  refunded: !!$json.refunded,\n  action: $json.action ?? 'refund_submitted',\n  at: new Date().toISOString()\n} }];"
+      },
+      "id": "audit",
+      "name": "Audit record",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1380,
+        460
+      ]
+    }
+  ],
+  "connections": {
+    "Refund request": {
+      "main": [
+        [
+          {
+            "node": "Validate request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate request": {
+      "main": [
+        [
+          {
+            "node": "Approval policy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approval policy": {
+      "main": [
+        [
+          {
+            "node": "Needs human approval?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs human approval?": {
+      "main": [
+        [
+          {
+            "node": "Ask for approval (Slack)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Issue refund (auto-approved)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ask for approval (Slack)": {
+      "main": [
+        [
+          {
+            "node": "Hold for approval",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hold for approval": {
+      "main": [
+        [
+          {
+            "node": "Audit record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Issue refund (auto-approved)": {
+      "main": [
+        [
+          {
+            "node": "Audit record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "description": "A refund workflow that FAILS CLOSED. Requests above AUTO_APPROVE_MAX are parked for a human (Slack approve/reject buttons) and are never refunded automatically. The approval rule is an explicit, auditable policy, and every request produces an audit record.",
+    "requires": [
+      "SLACK_WEBHOOK_APPROVALS",
+      "STRIPE_API_KEY",
+      "STRIPE_API_URL",
+      "AUTO_APPROVE_MAX"
+    ]
+  },
+  "tags": []
+}

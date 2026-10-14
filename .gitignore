@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+tests/_tmp_wf.json
+
+# Secrets - never commit keys or exported credentials
+.env
+*.key
+*token*
+*secret*
+n8n-credentials.json
+
+# n8n local data (if you run n8n from this folder)
+.n8n/
+*.sqlite
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
